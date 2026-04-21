@@ -1,0 +1,63 @@
+name: "Make release"
+
+on:
+  push:
+    tags: ["*"]
+
+env:
+  GH_TOKEN: ${{github.token}}
+  GH_REPO: ${{github.repository}}
+  TAG: ${{github.ref_name}}
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - platform: linux/amd64
+          runner: ubuntu-latest
+        - platform: linux/arm64
+          runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
+    steps:
+    - name: Checkout main
+      run: |
+        set -eo pipefail
+        echo ${TAG} | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' &&
+        TAG="openssl-${TAG}" ||
+        TAG=$(curl -sI https://github.com/openssl/openssl/releases/latest | grep -m1 -Eo 'openssl-[0-9]+\.[0-9]+\.[0-9]+')
+        BRANCH=${TAG%.*}
+        echo "TAG=${TAG}" >> $GITHUB_ENV
+        echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
+        git clone https://github.com/openssl/openssl --branch=${BRANCH} .
+        git checkout ${TAG}
+    - name: Draft a release
+      if: matrix.platform == 'linux/arm64'
+      run: |
+        gh release delete ${{github.ref_name}} --cleanup-tag
+        git remote set-url origin "https://${{secrets.GH_TOKEN}}@github.com/$GITHUB_REPOSITORY"
+        git push origin ${BRANCH}
+        TAG=${TAG#openssl-}
+        git tag ${TAG}
+        git push origin ${TAG}
+        gh release create ${TAG} --title ${TAG} --draft
+#    - name: QEMU
+#      if: matrix.runner == 'ubuntu-latest'
+#      run: |
+#        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+    - name: Build
+      run: |
+        docker run --platform=${{matrix.platform}} --rm -i -v=.:/openssl -w=/openssl alpine sh <<'EOT'
+        set -eo pipefail
+        apk add --no-cache make perl gcc musl-dev linux-headers
+        ./Configure CFLAGS='-Os -flto -fhardened -fcode-hoisting' LDFLAGS='-s -static' --openssldir=/etc/ssl enable-ec_nistp_64_gcc_128 enable-ktls no-docs no-shared no-tests no-tls1 no-tls1_1
+        make -sj$(nproc)
+        mv -v apps/openssl openssl-$(arch)
+        EOT
+    - name: Upload to release
+      run: |
+        gh release upload ${TAG#openssl-} openssl-*
